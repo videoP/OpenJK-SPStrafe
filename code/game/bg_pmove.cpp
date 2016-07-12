@@ -165,8 +165,8 @@ const float	pm_swimScale = 0.50f;
 float	pm_ladderScale = 0.7f;
 
 const float	pm_vehicleaccelerate = 36.0f;
-const float	pm_accelerate = 12.0f;
-const float	pm_airaccelerate = 4.0f;
+const float	pm_accelerate = 12.0f; //10.0 in MP
+const float	pm_airaccelerate = 4.0f; //1.0 in MP
 const float	pm_wateraccelerate = 4.0f;
 const float	pm_flyaccelerate = 8.0f;
 
@@ -562,11 +562,111 @@ PM_Friction
 Handles both ground friction and water friction
 ==================
 */
+static void PM_FrictionMP(void) {
+	vec3_t	vec;
+	float	*vel;
+	float	speed, newspeed, control;
+	float	drop;
+
+	vel = pm->ps->velocity;
+
+	VectorCopy(vel, vec);
+	if (pml.walking) {
+		vec[2] = 0;	// ignore slope movement
+	}
+
+	speed = VectorLength(vec);
+	if (speed < 1) {
+		vel[0] = 0;
+		vel[1] = 0;		// allow sinking underwater
+		if (pm->ps->pm_type == PM_SPECTATOR)
+		{
+			vel[2] = 0;
+		}
+		// FIXME: still have z friction underwater?
+		return;
+	}
+
+	drop = 0;
+
+	// apply ground friction, even if on ladder
+	if (pm->gent
+		&& pm->gent->client
+		&& pm->gent->client->NPC_class == CLASS_VEHICLE && pm->gent->m_pVehicle
+		&& pm->gent->m_pVehicle->m_pVehicleInfo->type != VH_ANIMAL)
+	{
+		float	friction = pm->gent->m_pVehicle->m_pVehicleInfo->friction;
+		if (!(pm->ps->pm_flags & PMF_TIME_KNOCKBACK) /*&& !(pm->ps->pm_flags & PMF_TIME_NOFRICTION)*/)
+		{
+			control = speed < pm_stopspeed ? pm_stopspeed : speed;
+			drop += control*friction*pml.frametime;
+		}
+	}
+	else if (Flying != FLY_NORMAL)
+	{
+		// apply ground friction
+		if (pm->waterlevel <= 1) {
+			if (pml.walking && !(pml.groundTrace.surfaceFlags & SURF_SLICK)) {
+				// if getting knocked back, no friction
+				if (!(pm->ps->pm_flags & PMF_TIME_KNOCKBACK)) {
+					control = speed < pm_stopspeed ? pm_stopspeed : speed;
+					drop += control*pm_friction*pml.frametime;
+				}
+			}
+		}
+	}
+	else if ((pm->ps->clientNum < MAX_CLIENTS || PM_ControlledByPlayer())
+		&& pm->gent
+		&& pm->gent->client
+		&& (pm->gent->client->NPC_class == CLASS_BOBAFETT || pm->gent->client->NPC_class == CLASS_ROCKETTROOPER) && pm->gent->client->moveType == MT_FLYSWIM)
+	{//player as Boba
+		drop += speed*pm_waterfriction*pml.frametime;
+	}
+
+	if (Flying == FLY_VEHICLE)
+	{
+		if (!(pm->ps->pm_flags & PMF_TIME_KNOCKBACK))
+		{
+			control = speed;// < pm_stopspeed ? pm_stopspeed : speed;
+			drop += control*pm_friction*pml.frametime;
+		}
+	}
+
+	// apply water friction even if just wading
+	if (pm->waterlevel) {
+		drop += speed*pm_waterfriction*pm->waterlevel*pml.frametime;
+	}
+	// If on a client then there is no friction
+	else if (pm->ps->groundEntityNum < MAX_CLIENTS)
+	{
+		drop = 0;
+	}
+
+	if (pm->ps->pm_type == PM_SPECTATOR)
+	{
+		drop += speed*pm_flightfriction*pml.frametime;
+	}
+
+	// scale the velocity
+	newspeed = speed - drop;
+	if (newspeed < 0) {
+		newspeed = 0;
+	}
+	newspeed /= speed;
+
+	VectorScale(vel, newspeed, vel);
+}
+
 static void PM_Friction( void ) {
 	vec3_t	vec;
 	float	*vel;
 	float	speed, newspeed, control;
 	float	drop, friction = pm->ps->friction;
+
+	if (g_allowBunnyhopping->integer > 3) {
+		PM_FrictionMP();
+		return;
+	}
 
 	vel = pm->ps->velocity;
 
@@ -728,6 +828,37 @@ PM_Accelerate
 Handles user intended acceleration
 ==============
 */
+
+static void PM_AccelerateMP( vec3_t wishdir, float wishspeed, float accel )
+{
+	int			i;
+	float		addspeed, accelspeed, currentspeed;
+
+	currentspeed = DotProduct (pm->ps->velocity, wishdir);
+	addspeed = wishspeed - currentspeed;
+	if (addspeed <= 0 && pm->ps->clientNum < MAX_CLIENTS) {
+		return;
+	}
+
+	if (addspeed < 0)
+	{
+		accelspeed = (-accel)*pml.frametime*wishspeed;
+		if (accelspeed < addspeed) {
+			accelspeed = addspeed;
+		}
+	}
+	else
+	{
+		accelspeed = accel*pml.frametime*wishspeed;
+		if (accelspeed > addspeed) {
+			accelspeed = addspeed;
+		}
+	}
+
+	for (i=0 ; i<3 ; i++) {
+		pm->ps->velocity[i] += accelspeed*wishdir[i];
+	}
+}
 
 static void PM_Accelerate( vec3_t wishdir, float wishspeed, float accel )
 {
@@ -2894,6 +3025,108 @@ PM_AirMove
 
 ===================
 */
+
+static void PM_AirMoveMP( void ) {
+	int			i;
+	vec3_t		wishvel;
+	float		fmove, smove;
+	vec3_t		wishdir;
+	float		wishspeed;
+	float		scale;
+	float		accelerate;
+	usercmd_t	cmd;
+	Vehicle_t	*pVeh = NULL;
+
+	if ( pm->gent->client && pm->gent->client->NPC_class == CLASS_VEHICLE )
+	{
+		pVeh = pm->gent->m_pVehicle;
+	}
+
+#if METROID_JUMP
+	PM_CheckJump();
+#endif
+	PM_Friction();
+
+	fmove = pm->cmd.forwardmove;
+	smove = pm->cmd.rightmove;
+
+	cmd = pm->cmd;
+	scale = PM_CmdScale( &cmd );
+
+	// set the movementDir so clients can rotate the legs for strafing
+	PM_SetMovementDir();
+
+	// project moves down to flat plane
+	pml.forward[2] = 0;
+	pml.right[2] = 0;
+	VectorNormalize (pml.forward);
+	VectorNormalize (pml.right);
+
+	if ( pVeh && pVeh->m_pVehicleInfo->hoverHeight > 0 )
+	{//in a hovering vehicle, have air control
+		if ( 1 )
+		{
+			wishspeed = pm->ps->speed;
+			VectorScale( pm->ps->moveDir, pm->ps->speed, wishvel );
+			VectorCopy( pm->ps->moveDir, wishdir );
+			scale = 1.0f;
+		}
+	}
+	else if ( (pm->ps->pm_flags&PMF_SLOW_MO_FALL) )
+	{//no air-control
+		VectorClear( wishvel );
+	}
+	else
+	{
+		for ( i = 0 ; i < 2 ; i++ )
+		{
+			wishvel[i] = pml.forward[i]*fmove + pml.right[i]*smove;
+		}
+		wishvel[2] = 0;
+	}
+
+	VectorCopy (wishvel, wishdir);
+	wishspeed = VectorNormalize(wishdir);
+	wishspeed *= scale;
+
+	accelerate = 1.0f;//pm_airaccelerate;
+	if ( pVeh && pVeh->m_pVehicleInfo->type == VH_SPEEDER )
+	{//speeders have more control in air
+		//in mid-air
+		accelerate = pVeh->m_pVehicleInfo->traction;
+		if ( pml.groundPlane )
+		{//on a slope of some kind, shouldn't have much control and should slide a lot
+			accelerate *= 0.5f;
+		}
+	}
+	// not on ground, so little effect on velocity
+	PM_AccelerateMP (wishdir, wishspeed, accelerate);
+
+	// we may have a ground plane that is very steep, even
+	// though we don't have a groundentity
+	// slide along the steep plane
+	if ( pml.groundPlane )
+	{
+		if ( !(pm->ps->pm_flags&PMF_STUCK_TO_WALL) )
+		{//don't slide when stuck to a wall
+			if ( PM_GroundSlideOkay( pml.groundTrace.plane.normal[2] ) )
+			{
+				PM_ClipVelocity (pm->ps->velocity, pml.groundTrace.plane.normal,
+					pm->ps->velocity, OVERCLIP );
+			}
+		}
+	}
+
+	if ( (pm->ps->pm_flags&PMF_STUCK_TO_WALL) )
+	{//no grav when stuck to wall
+		PM_StepSlideMove( qfalse );
+	}
+	else
+	{
+		PM_StepSlideMove( qtrue );
+	}
+}
+
 static void PM_AirMove( void ) {
 	int			i;
 	vec3_t		wishvel;
@@ -2902,6 +3135,11 @@ static void PM_AirMove( void ) {
 	float		wishspeed;
 	usercmd_t	cmd;
 	float		gravMod = 1.0f;
+
+	if (g_allowBunnyhopping->integer > 2) {
+		PM_AirMoveMP();
+		return;
+	}
 
 #if METROID_JUMP
 	PM_CheckJump();
@@ -3085,6 +3323,183 @@ PM_WalkMove
 
 ===================
 */
+static void PM_WalkMoveMP(void) {
+	int			i;
+	vec3_t		wishvel;
+	float		fmove, smove;
+	vec3_t		wishdir;
+	float		wishspeed = 0.0f;
+	float		scale;
+	usercmd_t	cmd;
+	float		accelerate;
+	float		vel;
+	qboolean	npcMovement = qfalse;
+
+	if (pm->waterlevel > 2 && DotProduct(pml.forward, pml.groundTrace.plane.normal) > 0) {
+		// begin swimming
+		PM_WaterMove();
+		return;
+	}
+
+
+	if (pm->ps->pm_type != PM_SPECTATOR)
+	{
+		if (PM_CheckJump()) {
+			// jumped away
+			if (pm->waterlevel > 1) {
+				PM_WaterMove();
+			}
+			else {
+				PM_AirMove();
+			}
+			return;
+		}
+	}
+
+	PM_Friction();
+
+	fmove = pm->cmd.forwardmove;
+	smove = pm->cmd.rightmove;
+
+	cmd = pm->cmd;
+	scale = PM_CmdScale(&cmd);
+
+	// set the movementDir so clients can rotate the legs for strafing
+	PM_SetMovementDir();
+
+	// project moves down to flat plane
+	pml.forward[2] = 0;
+	pml.right[2] = 0;
+
+	// project the forward and right directions onto the ground plane
+	PM_ClipVelocity(pml.forward, pml.groundTrace.plane.normal, pml.forward, OVERCLIP);
+	PM_ClipVelocity(pml.right, pml.groundTrace.plane.normal, pml.right, OVERCLIP);
+	//
+	VectorNormalize(pml.forward);
+	VectorNormalize(pml.right);
+
+	// Get The WishVel And WishSpeed
+	//-------------------------------
+	if (pm->ps->clientNum && (USENEWNAVSYSTEM || !VectorCompare(pm->ps->moveDir, vec3_origin)))
+	{//NPC
+		// If The UCmds Were Set, But Never Converted Into A MoveDir, Then Make The WishDir From UCmds
+		//--------------------------------------------------------------------------------------------
+		if ((fmove != 0.0f || smove != 0.0f) && VectorCompare(pm->ps->moveDir, vec3_origin))
+		{
+			//trap->Printf("Generating MoveDir\n");
+			for (i = 0; i < 3; i++)
+			{
+				wishvel[i] = pml.forward[i] * fmove + pml.right[i] * smove;
+			}
+
+			VectorCopy(wishvel, wishdir);
+			wishspeed = VectorNormalize(wishdir);
+			wishspeed *= scale;
+		}
+		// Otherwise, Use The Move Dir
+		//-----------------------------
+		else
+		{
+			//wishspeed = pm->ps->speed;
+			VectorScale(pm->ps->moveDir, pm->ps->speed, wishvel);
+			VectorCopy(wishvel, wishdir);
+			wishspeed = VectorNormalize(wishdir);
+		}
+
+		npcMovement = qtrue;
+	}
+
+	if (!npcMovement)
+	{
+		for (i = 0; i < 3; i++) {
+			wishvel[i] = pml.forward[i] * fmove + pml.right[i] * smove;
+		}
+		// when going up or down slopes the wish velocity should Not be zero
+
+		VectorCopy(wishvel, wishdir);
+		wishspeed = VectorNormalize(wishdir);
+		wishspeed *= scale;
+	}
+
+	// clamp the speed lower if ducking
+	if (pm->ps->pm_flags & PMF_DUCKED) {
+		if (wishspeed > pm->ps->speed * pm_duckScale) {
+			wishspeed = pm->ps->speed * pm_duckScale;
+		}
+	}
+	/* //loda - fixme
+	else if ((pm->ps->pm_flags & PMF_ROLLING) && !BG_InRoll(pm->ps, pm->ps->legsAnim) &&
+		!PM_InRollComplete(pm->ps, pm->ps->legsAnim))
+	{
+		if (wishspeed > pm->ps->speed * pm_duckScale) {
+			wishspeed = pm->ps->speed * pm_duckScale;
+		}
+	}
+	*/
+
+	// clamp the speed lower if wading or walking on the bottom
+	if (pm->waterlevel) {
+		float	waterScale;
+
+		waterScale = pm->waterlevel / 3.0;
+		waterScale = 1.0 - (1.0 - pm_swimScale) * waterScale;
+		if (wishspeed > pm->ps->speed * waterScale) {
+			wishspeed = pm->ps->speed * waterScale;
+		}
+	}
+
+	// when a player gets hit, they temporarily lose
+	// full control, which allows them to be moved a bit
+	if (Flying == FLY_HOVER)
+	{
+		accelerate = pm_vehicleaccelerate;
+	}
+	else if ((pml.groundTrace.surfaceFlags & SURF_SLICK) || (pm->ps->pm_flags&PMF_TIME_KNOCKBACK) || (pm->ps->pm_flags&PMF_TIME_NOFRICTION))
+	{
+		if (g_allowBunnyhopping->integer > 2) {
+			accelerate = 1.0f;
+		}
+		else {
+			accelerate = pm_airaccelerate;
+		}
+	}
+	else
+	{
+		if (g_allowBunnyhopping->integer > 2) {
+			accelerate = 10.0f;
+		}
+		else {
+			accelerate = pm_accelerate;
+		}
+	}
+
+	PM_AccelerateMP(wishdir, wishspeed, accelerate);
+
+	if ((pml.groundTrace.surfaceFlags & SURF_SLICK) || pm->ps->pm_flags & PMF_TIME_KNOCKBACK)
+	{
+		pm->ps->velocity[2] -= pm->ps->gravity * pml.frametime;
+	}
+
+	vel = VectorLength(pm->ps->velocity);
+
+	// slide along the ground plane
+	PM_ClipVelocity(pm->ps->velocity, pml.groundTrace.plane.normal,
+		pm->ps->velocity, OVERCLIP);
+
+	// don't decrease velocity when going up or down a slope
+	VectorNormalize(pm->ps->velocity);
+	VectorScale(pm->ps->velocity, vel, pm->ps->velocity);
+
+	// don't do anything if standing still
+	if (!pm->ps->velocity[0] && !pm->ps->velocity[1]) {
+		return;
+	}
+
+	PM_StepSlideMove(qfalse);
+
+	//Com_Printf("velocity2 = %1.1f\n", VectorLength(pm->ps->velocity));
+}
+
 static void PM_WalkMove( void ) {
 	int			i;
 	vec3_t		wishvel;
@@ -3095,6 +3510,11 @@ static void PM_WalkMove( void ) {
 	usercmd_t	cmd;
 	float		accelerate;
 	float		vel;
+
+	if (g_allowBunnyhopping->integer > 3) {
+		PM_WalkMoveMP();
+		return;
+	}
 
 	if ( pm->ps->gravity < 0 )
 	{//float away
@@ -3287,7 +3707,7 @@ static void PM_WalkMove( void ) {
 		accelerate = pm_airaccelerate;
 	}
 	else
-	{
+	{	
 		accelerate = pm_accelerate;
 
 		// Wind Affects Acceleration
