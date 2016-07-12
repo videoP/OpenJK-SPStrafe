@@ -760,6 +760,7 @@ This allows the clients to use axial -127 to 127 values for all directions
 without getting a sqrt(2) distortion in speed.
 ============
 */
+/*
 static float PM_CmdScale( usercmd_t *cmd )
 {
 	int		max;
@@ -782,6 +783,35 @@ static float PM_CmdScale( usercmd_t *cmd )
 				  + ( cmd->upmove * cmd->upmove )) );
 
 	scale = (float) pm->ps->speed * max / ( 127.0f * total );
+
+	return scale;
+}
+*/
+
+static float PM_CmdScale( usercmd_t *cmd ) {
+	int		max;
+	float	total;
+	float	scale;
+	int		umove = cmd->upmove;
+			//don't factor upmove into scaling speed
+
+	if (g_allowBunnyhopping->integer > 1) //Fix accel when holding jump key in air
+		umove = 0;
+
+	max = abs( cmd->forwardmove );
+	if ( abs( cmd->rightmove ) > max ) {
+		max = abs( cmd->rightmove );
+	}
+	if ( abs( umove ) > max ) {
+		max = abs( umove );
+	}
+	if ( !max ) {
+		return 0;
+	}
+
+	total = sqrt( (float)(cmd->forwardmove * cmd->forwardmove
+		+ cmd->rightmove * cmd->rightmove + umove * umove) );
+	scale = (float)pm->ps->speed * max / ( 127.0 * total );
 
 	return scale;
 }
